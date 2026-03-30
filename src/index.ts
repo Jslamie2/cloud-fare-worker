@@ -37,6 +37,7 @@ export default {
 				apiBaseUrl: env.API_BASE_URL,
 				timezone: IOWA_TIMEZONE,
 				anchorDate: ANCHOR_DATE,
+				cadenceDays: 5,
 				prewarmTime: "3:14 PM",
 				targetTime: "3:15 PM",
 				now: new Date().toISOString(),
@@ -67,9 +68,9 @@ async function handleScheduledRun(controller: ScheduledController, env: Env) {
 		return;
 	}
 
-	if (!isActiveScheduleDate(local.date)) {
+	if (!isFiveDaySchedule(local.date)) {
 		console.log(
-			`Skipping run: ${local.date} is before the schedule anchor date ${ANCHOR_DATE}`,
+			`Skipping run: ${local.date} is not on the 5-day cadence from ${ANCHOR_DATE}`,
 		);
 		return;
 	}
@@ -96,8 +97,9 @@ function isTargetTime(local: ZonedParts) {
 	return local.hour === TARGET_HOUR && local.minute === TARGET_MINUTE;
 }
 
-function isActiveScheduleDate(localDate: string) {
-	return diffDaysUtc(ANCHOR_DATE, localDate) >= 0;
+function isFiveDaySchedule(localDate: string) {
+	const daysSinceAnchor = diffDaysUtc(ANCHOR_DATE, localDate);
+	return daysSinceAnchor >= 0 && daysSinceAnchor % 5 === 0;
 }
 
 async function triggerCampaign(env: Env) {
