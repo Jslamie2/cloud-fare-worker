@@ -6,7 +6,8 @@ export interface Env {
 const IOWA_TIMEZONE = "America/Chicago";
 const ANCHOR_DATE = "2026-03-30";
 const TARGET_HOUR = 14;
-const TARGET_MINUTE = 30;
+const PREWARM_MINUTE = 54;
+const TARGET_MINUTE = 55;
 
 export default {
 	async scheduled(
@@ -36,7 +37,8 @@ export default {
 				apiBaseUrl: env.API_BASE_URL,
 				timezone: IOWA_TIMEZONE,
 				anchorDate: ANCHOR_DATE,
-				targetTime: "2:30 PM",
+				prewarmTime: "2:54 PM",
+				targetTime: "2:55 PM",
 				now: new Date().toISOString(),
 			});
 		}
@@ -60,15 +62,21 @@ async function handleScheduledRun(controller: ScheduledController, env: Env) {
 		}),
 	);
 
-	if (!isTargetTime(local)) {
-		console.log("Skipping run: not 2:30 PM Iowa time");
+	if (!isScheduledMinute(local)) {
+		console.log("Skipping run: not a scheduled 2:54 PM or 2:55 PM Iowa time");
 		return;
 	}
 
-	if (!isFiveDaySchedule(local.date)) {
+	if (!isActiveScheduleDate(local.date)) {
 		console.log(
-			`Skipping run: ${local.date} is not on the 5-day cadence from ${ANCHOR_DATE}`,
+			`Skipping run: ${local.date} is before the schedule anchor date ${ANCHOR_DATE}`,
 		);
+		return;
+	}
+
+	if (isPrewarmTime(local)) {
+		const result = await prewarmCampaignEndpoint(env);
+		console.log(JSON.stringify({ event: "campaign_prewarm_result", result }));
 		return;
 	}
 
@@ -76,13 +84,20 @@ async function handleScheduledRun(controller: ScheduledController, env: Env) {
 	console.log(JSON.stringify({ event: "campaign_result", result }));
 }
 
+function isScheduledMinute(local: ZonedParts) {
+	return isPrewarmTime(local) || isTargetTime(local);
+}
+
+function isPrewarmTime(local: ZonedParts) {
+	return local.hour === TARGET_HOUR && local.minute === PREWARM_MINUTE;
+}
+
 function isTargetTime(local: ZonedParts) {
 	return local.hour === TARGET_HOUR && local.minute === TARGET_MINUTE;
 }
 
-function isFiveDaySchedule(localDate: string) {
-	const daysSinceAnchor = diffDaysUtc(ANCHOR_DATE, localDate);
-	return daysSinceAnchor >= 0 && daysSinceAnchor % 5 === 0;
+function isActiveScheduleDate(localDate: string) {
+	return diffDaysUtc(ANCHOR_DATE, localDate) >= 0;
 }
 
 async function triggerCampaign(env: Env) {
@@ -99,6 +114,42 @@ async function triggerCampaign(env: Env) {
 				source: "cloudflare-worker",
 				scheduledAt: new Date().toISOString(),
 			}),
+		});
+
+		const text = await response.text();
+		let data: unknown = text;
+
+		try {
+			data = JSON.parse(text);
+		} catch {
+			// Keep raw text if the upstream response is not JSON.
+		}
+
+		return {
+			success: response.ok,
+			status: response.status,
+			endpoint,
+			data,
+		};
+	} catch (error) {
+		return {
+			success: false,
+			endpoint,
+			error: error instanceof Error ? error.message : String(error),
+		};
+	}
+}
+
+async function prewarmCampaignEndpoint(env: Env) {
+	const endpoint = `${env.API_BASE_URL.replace(/\/$/, "")}/api/notifications/campaign/five-day`;
+
+	try {
+		const response = await fetch(endpoint, {
+			method: "GET",
+			headers: {
+				"x-cron-secret": env.CRON_API_SECRET,
+				"x-prewarm": "true",
+			},
 		});
 
 		const text = await response.text();
