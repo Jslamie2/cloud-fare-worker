@@ -6,8 +6,8 @@ export interface Env {
 const IOWA_TIMEZONE = "America/Chicago";
 const ANCHOR_DATE = "2026-03-30";
 const TARGET_HOUR = 16;
-const PREWARM_MINUTE = 29;
-const TARGET_MINUTE = 30;
+const PREWARM_MINUTE = 44;
+const TARGET_MINUTE = 45;
 
 export default {
 	async scheduled(
@@ -35,11 +35,13 @@ export default {
 				success: true,
 				service: "campaign-cron-worker",
 				apiBaseUrl: env.API_BASE_URL,
+				hasCronApiSecret: Boolean(env.CRON_API_SECRET),
+				cronApiSecretLength: env.CRON_API_SECRET?.length ?? 0,
 				timezone: IOWA_TIMEZONE,
 				anchorDate: ANCHOR_DATE,
 				cadenceDays: 5,
-				prewarmTime: "4:29 PM",
-				targetTime: "4:30 PM",
+				prewarmTime: "4:44 PM",
+				targetTime: "4:45 PM",
 				now: new Date().toISOString(),
 			});
 		}
@@ -64,7 +66,7 @@ async function handleScheduledRun(controller: ScheduledController, env: Env) {
 	);
 
 	if (!isScheduledMinute(local)) {
-		console.log("Skipping run: not a scheduled 4:29 PM or 4:30 PM Iowa time");
+		console.log("Skipping run: not a scheduled 4:44 PM or 4:45 PM Iowa time");
 		return;
 	}
 
