@@ -5,9 +5,9 @@ export interface Env {
 
 const IOWA_TIMEZONE = "America/Chicago";
 const ANCHOR_DATE = "2026-03-30";
-const TARGET_HOUR = 15;
-const PREWARM_MINUTE = 39;
-const TARGET_MINUTE = 40;
+const TARGET_HOUR = 16;
+const PREWARM_MINUTE = 29;
+const TARGET_MINUTE = 30;
 
 export default {
 	async scheduled(
@@ -38,8 +38,8 @@ export default {
 				timezone: IOWA_TIMEZONE,
 				anchorDate: ANCHOR_DATE,
 				cadenceDays: 5,
-				prewarmTime: "3:39 PM",
-				targetTime: "3:40 PM",
+				prewarmTime: "4:29 PM",
+				targetTime: "4:30 PM",
 				now: new Date().toISOString(),
 			});
 		}
@@ -64,7 +64,7 @@ async function handleScheduledRun(controller: ScheduledController, env: Env) {
 	);
 
 	if (!isScheduledMinute(local)) {
-		console.log("Skipping run: not a scheduled 3:39 PM or 3:40 PM Iowa time");
+		console.log("Skipping run: not a scheduled 4:29 PM or 4:30 PM Iowa time");
 		return;
 	}
 
