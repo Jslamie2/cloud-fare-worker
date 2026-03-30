@@ -20,6 +20,10 @@ export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
 		const url = new URL(request.url);
 
+		if (url.pathname === "/") {
+			return new Response("Hello World");
+		}
+
 		if (url.pathname === "/test-run" && request.method === "POST") {
 			const result = await triggerCampaign(env);
 			return json(result, result.success ? 200 : 500);
