@@ -11,32 +11,82 @@ const PREWARM_MINUTE = 44;
 const TARGET_MINUTE = 45;
 
 // =================================================================
+// VALIDATION UTILITIES
+// =================================================================
+function isValidRideId(rideId: string): boolean {
+  return typeof rideId === 'string' && rideId.length > 0 && /^[a-zA-Z0-9\-_]+$/.test(rideId);
+}
+
+function isValidTimezone(timezone: string): boolean {
+  try {
+    Intl.DateTimeFormat(undefined, { timeZone: timezone });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isValidISOString(dateStr: string): boolean {
+  const date = new Date(dateStr);
+  return !isNaN(date.getTime()) && dateStr.includes('T');
+}
+
+// =================================================================
 // RIDE SCHEDULER DURABLE OBJECT
 // =================================================================
 export class RideScheduler implements DurableObject {
   constructor(private state: DurableObjectState, private env: Env) {}
 
   async fetch(request: Request): Promise<Response> {
+    // Enhanced authentication
     const authHeader = request.headers.get("Authorization");
-
-    if (
-      !this.env.CRON_API_SECRET ||
-      authHeader !== `Bearer ${this.env.CRON_API_SECRET}`
-    ) {
+    if (!this.env.CRON_API_SECRET || authHeader !== `Bearer ${this.env.CRON_API_SECRET}`) {
       return new Response("Unauthorized", { status: 401 });
     }
 
-    const { rideId, startTime, endTime, timezone } = (await request.json()) as {
+    // Validate content type
+    const contentType = request.headers.get("content-type");
+    if (!contentType?.includes("application/json")) {
+      return new Response("Content-Type must be application/json", { status: 400 });
+    }
+
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return new Response("Invalid JSON body", { status: 400 });
+    }
+
+    const { rideId, startTime, endTime, timezone } = body as {
       rideId?: string;
       startTime?: string;
       endTime?: string;
       timezone?: string;
     };
 
+    // Enhanced validation
     if (!rideId || !startTime || !endTime) {
       return new Response(
-        "Bad request: Missing rideId, startTime, or endTime",
-        { status: 400 }
+        JSON.stringify({ 
+          error: "Missing required fields", 
+          required: ["rideId", "startTime", "endTime"],
+          received: { rideId: !!rideId, startTime: !!startTime, endTime: !!endTime }
+        }), 
+        { status: 400, headers: { "content-type": "application/json" } }
+      );
+    }
+
+    if (!isValidRideId(rideId)) {
+      return new Response(
+        JSON.stringify({ error: "Invalid rideId format" }), 
+        { status: 400, headers: { "content-type": "application/json" } }
+      );
+    }
+
+    if (!isValidISOString(startTime) || !isValidISOString(endTime)) {
+      return new Response(
+        JSON.stringify({ error: "startTime and endTime must be valid ISO 8601 strings" }), 
+        { status: 400, headers: { "content-type": "application/json" } }
       );
     }
 
@@ -44,50 +94,80 @@ export class RideScheduler implements DurableObject {
     const endTimeMs = new Date(endTime).getTime();
 
     if (!Number.isFinite(startTimeMs) || !Number.isFinite(endTimeMs)) {
-      return new Response("Bad request: Invalid startTime or endTime", {
-        status: 400,
-      });
+      return new Response(
+        JSON.stringify({ error: "Invalid startTime or endTime" }), 
+        { status: 400, headers: { "content-type": "application/json" } }
+      );
     }
 
     if (endTimeMs <= startTimeMs) {
-      return new Response("Bad request: endTime must be after startTime", {
-        status: 400,
-      });
+      return new Response(
+        JSON.stringify({ error: "endTime must be after startTime" }), 
+        { status: 400, headers: { "content-type": "application/json" } }
+      );
     }
 
-    await this.state.storage.put("rideId", rideId);
-    await this.state.storage.put("startTime", startTime);
-    await this.state.storage.put("endTime", endTime);
-    await this.state.storage.put("timezone", timezone || IOWA_TIMEZONE);
-    await this.state.storage.put("phase", "scheduled_start");
+    // Validate timezone
+    const resolvedTimezone = timezone && isValidTimezone(timezone) ? timezone : IOWA_TIMEZONE;
 
-    await this.state.storage.setAlarm(startTimeMs);
+    // Check if start time is in the future (with 5-minute buffer)
+    const now = Date.now();
+    const fiveMinuteBuffer = 5 * 60 * 1000;
+    if (startTimeMs < now - fiveMinuteBuffer) {
+      return new Response(
+        JSON.stringify({ error: "startTime cannot be more than 5 minutes in the past" }), 
+        { status: 400, headers: { "content-type": "application/json" } }
+      );
+    }
 
-    return json({
-      success: true,
-      rideId,
-      startAlarmAt: startTime,
-      endAlarmAt: endTime,
-    });
+    try {
+      await this.state.storage.put("rideId", rideId);
+      await this.state.storage.put("startTime", startTime);
+      await this.state.storage.put("endTime", endTime);
+      await this.state.storage.put("timezone", resolvedTimezone);
+      await this.state.storage.put("phase", "scheduled_start");
+      await this.state.storage.put("createdAt", new Date().toISOString());
+
+      await this.state.storage.setAlarm(startTimeMs);
+
+      return new Response(JSON.stringify({
+        success: true,
+        rideId,
+        startAlarmAt: startTime,
+        endAlarmAt: endTime,
+        timezone: resolvedTimezone,
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+
+    } catch (error) {
+      console.error("Failed to schedule ride:", error);
+      return new Response(
+        JSON.stringify({ error: "Internal server error" }), 
+        { status: 500, headers: { "content-type": "application/json" } }
+      );
+    }
   }
 
   async alarm(): Promise<void> {
     const rideId = await this.state.storage.get<string>("rideId");
     const endTime = await this.state.storage.get<string>("endTime");
-    const phase =
-      (await this.state.storage.get<string>("phase")) || "scheduled_start";
+    const phase = await this.state.storage.get<string>("phase") || "scheduled_start";
+    const createdAt = await this.state.storage.get<string>("createdAt");
 
     if (!rideId || !endTime) {
-      console.error("Missing ride scheduler state", { rideId, endTime, phase });
+      console.error("Missing ride scheduler state", { rideId, endTime, phase, createdAt });
       return;
     }
 
     let newStatus: string;
+    let nextAlarmTime: number | null = null;
 
     if (phase === "scheduled_start") {
       newStatus = "ongoing";
       await this.state.storage.put("phase", "scheduled_end");
-      await this.state.storage.setAlarm(new Date(endTime).getTime());
+      nextAlarmTime = new Date(endTime).getTime();
     } else {
       newStatus = "completed";
       await this.state.storage.put("phase", "finished");
@@ -101,8 +181,12 @@ export class RideScheduler implements DurableObject {
         headers: {
           Authorization: `Bearer ${this.env.CRON_API_SECRET}`,
           "Content-Type": "application/json",
+          "User-Agent": "Cloudflare-Worker/1.0"
         },
-        body: JSON.stringify({ status: newStatus }),
+        body: JSON.stringify({ 
+          status: newStatus,
+          updatedAt: new Date().toISOString()
+        }),
       });
 
       if (!response.ok) {
@@ -111,10 +195,42 @@ export class RideScheduler implements DurableObject {
           status: response.status,
           body: text,
           sentStatus: newStatus,
+          targetUrl
         });
+        
+        // Store failure for potential retry
+        await this.state.storage.put("lastFailure", {
+          timestamp: new Date().toISOString(),
+          status: response.status,
+          body: text,
+          sentStatus: newStatus
+        });
+      } else {
+        console.log(`Successfully updated ride ${rideId} to status: ${newStatus}`);
+        // Clear any previous failures
+        await this.state.storage.delete("lastFailure");
       }
-    } catch (e) {
-      console.error(`Exception while updating ride ${rideId}:`, e);
+
+      // Set next alarm if needed
+      if (nextAlarmTime) {
+        await this.state.storage.setAlarm(nextAlarmTime);
+      }
+
+    } catch (error) {
+      console.error(`Exception while updating ride ${rideId}:`, error);
+      
+      // Store exception for potential retry
+      await this.state.storage.put("lastFailure", {
+        timestamp: new Date().toISOString(),
+        error: String(error),
+        sentStatus: newStatus
+      });
+
+      // Retry logic for start phase
+      if (phase === "scheduled_start") {
+        const retryDelay = 60 * 1000; // 1 minute retry
+        await this.state.storage.setAlarm(Date.now() + retryDelay);
+      }
     }
   }
 }
@@ -133,43 +249,97 @@ export default {
 
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    const method = request.method;
+
+    // CORS headers
+    const corsHeaders = {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    };
+
+    if (method === "OPTIONS") {
+      return new Response(null, { headers: corsHeaders });
+    }
 
     if (url.pathname.startsWith("/schedule-ride")) {
       const rideId = url.searchParams.get("rideId");
       if (!rideId) {
-        return new Response("rideId query param is required", { status: 400 });
+        return new Response(
+          JSON.stringify({ error: "rideId query param is required" }), 
+          { status: 400, headers: { "content-type": "application/json", ...corsHeaders } }
+        );
       }
 
-      const id = env.RIDE_SCHEDULER.idFromName(rideId);
-      const stub = env.RIDE_SCHEDULER.get(id);
-      return stub.fetch(request);
+      if (!isValidRideId(rideId)) {
+        return new Response(
+          JSON.stringify({ error: "Invalid rideId format" }), 
+          { status: 400, headers: { "content-type": "application/json", ...corsHeaders } }
+        );
+      }
+
+      try {
+        const id = env.RIDE_SCHEDULER.idFromName(rideId);
+        const stub = env.RIDE_SCHEDULER.get(id);
+        const response = await stub.fetch(request);
+        
+        // Add CORS headers to response
+        const newHeaders = new Headers(response.headers);
+        Object.entries(corsHeaders).forEach(([key, value]) => {
+          newHeaders.set(key, value);
+        });
+        
+        return new Response(response.body, {
+          status: response.status,
+          headers: newHeaders
+        });
+      } catch (error) {
+        console.error("Failed to create/access Durable Object:", error);
+        return new Response(
+          JSON.stringify({ error: "Failed to schedule ride" }), 
+          { status: 500, headers: { "content-type": "application/json", ...corsHeaders } }
+        );
+      }
     }
 
     if (url.pathname === "/") {
-      return new Response("Hello World");
+      return new Response("Cloudflare Worker - Ride Scheduler Service", {
+        headers: { "content-type": "text/plain", ...corsHeaders }
+      });
     }
 
-    if (url.pathname === "/test-run" && request.method === "POST") {
+    if (url.pathname === "/test-run" && method === "POST") {
       const result = await triggerCampaign(env);
-      return json(result, result.success ? 200 : 500);
+      return new Response(JSON.stringify(result), {
+        status: result.success ? 200 : 500,
+        headers: { "content-type": "application/json", ...corsHeaders }
+      });
     }
 
     if (url.pathname === "/health") {
-      return json({
+      return new Response(JSON.stringify({
         success: true,
         service: "campaign-cron-worker",
         apiBaseUrl: env.API_BASE_URL,
         timezone: IOWA_TIMEZONE,
         now: new Date().toISOString(),
+        timestamp: Date.now()
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json", ...corsHeaders }
       });
     }
 
-    return new Response("Not found", { status: 404 });
+    return new Response(JSON.stringify({ error: "Not found" }), {
+      status: 404,
+      headers: { "content-type": "application/json", ...corsHeaders }
+    });
   },
 } satisfies ExportedHandler<Env>;
 
-// --- Helper Functions ---
-
+// =================================================================
+// CAMPAIGN FUNCTIONS
+// =================================================================
 async function handleScheduledRun(
   controller: ScheduledController,
   env: Env
@@ -209,17 +379,30 @@ async function triggerCampaign(env: Env) {
     const response = await fetch(endpoint, {
       method: "POST",
       headers: {
-        "x-cron-secret": env.CRON_API_SECRET,
+        Authorization: `Bearer ${env.CRON_API_SECRET}`, // Fixed: Use consistent auth
         "content-type": "application/json",
+        "User-Agent": "Cloudflare-Worker/1.0"
       },
       body: JSON.stringify({
         source: "cloudflare-worker",
         scheduledAt: new Date().toISOString(),
       }),
     });
-    return { success: response.ok, status: response.status, data: await response.text() };
+    
+    const responseText = await response.text();
+    return { 
+      success: response.ok, 
+      status: response.status, 
+      data: responseText,
+      endpoint
+    };
   } catch (error) {
-    return { success: false, error: String(error) };
+    console.error("Campaign trigger failed:", error);
+    return { 
+      success: false, 
+      error: String(error),
+      endpoint
+    };
   }
 }
 
@@ -228,16 +411,31 @@ async function prewarmCampaignEndpoint(env: Env) {
   try {
     const response = await fetch(endpoint, {
       method: "GET",
-      headers: { "x-cron-secret": env.CRON_API_SECRET, "x-prewarm": "true" },
+      headers: { 
+        Authorization: `Bearer ${env.CRON_API_SECRET}`, // Fixed: Use consistent auth
+        "x-prewarm": "true",
+        "User-Agent": "Cloudflare-Worker/1.0"
+      },
     });
-    return { success: response.ok, status: response.status };
+    
+    return { 
+      success: response.ok, 
+      status: response.status,
+      endpoint
+    };
   } catch (error) {
-    return { success: false, error: String(error) };
+    console.error("Campaign prewarm failed:", error);
+    return { 
+      success: false, 
+      error: String(error),
+      endpoint
+    };
   }
 }
 
-// --- Date Utilities ---
-
+// =================================================================
+// DATE UTILITIES
+// =================================================================
 type ZonedParts = {
   date: string;
   year: number;
@@ -276,11 +474,4 @@ function diffDaysUtc(fromDate: string, toDate: string) {
   const from = new Date(`${fromDate}T00:00:00Z`).getTime();
   const to = new Date(`${toDate}T00:00:00Z`).getTime();
   return Math.floor((to - from) / 86_400_000);
-}
-
-function json(data: unknown, status = 200) {
-  return new Response(JSON.stringify(data, null, 2), {
-    status,
-    headers: { "content-type": "application/json; charset=utf-8" },
-  });
 }
